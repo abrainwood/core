@@ -13,7 +13,7 @@ from pyoverkiz.auth.credentials import (
 )
 from pyoverkiz.client import OverkizClient, OverkizClientSettings
 from pyoverkiz.const import REXEL_OAUTH_CLIENT_ID
-from pyoverkiz.enums import APIType, OverkizState, Server, UIClass, UIWidget
+from pyoverkiz.enums import APIType, OverkizState, Protocol, Server, UIClass, UIWidget
 from pyoverkiz.exceptions import (
     BadCredentialsError,
     MaintenanceError,
@@ -151,6 +151,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: OverkizDataConfigEntry) 
         raise ConfigEntryNotReady("Server is down for maintenance") from exception
     except ServiceUnavailableError as exception:
         raise ConfigEntryNotReady("Server is unavailable") from exception
+
+    if api_type == APIType.LOCAL and all(
+        device.identifier.protocol is Protocol.INTERNAL for device in setup.devices
+    ):
+        raise ConfigEntryNotReady("Gateway has not reported its devices yet")
 
     coordinator = OverkizDataUpdateCoordinator(
         hass,

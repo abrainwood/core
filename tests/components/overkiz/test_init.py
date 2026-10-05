@@ -1,5 +1,6 @@
 """Tests for Overkiz integration init."""
 
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import ClientError
@@ -8,6 +9,7 @@ from pyoverkiz.exceptions import (
     ServiceUnavailableError,
     TooManyRequestsError,
 )
+from pyoverkiz.models import Device
 import pytest
 
 from homeassistant import config_entries
@@ -20,12 +22,21 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
 
 from .conftest import MockOverkizClient
 from .test_config_flow import TEST_EMAIL, TEST_GATEWAY_ID, TEST_PASSWORD, TEST_SERVER
 
-from tests.common import MockConfigEntry, RegistryEntryWithDefaults, mock_registry
+from tests.common import (
+    MockConfigEntry,
+    RegistryEntryWithDefaults,
+    async_fire_time_changed,
+    mock_registry,
+)
 
+SETUP_FIXTURE_WITH_INTERNAL_DEVICES = "setup/local_somfy_tahoma_switch_europe.json"
+ENTITY_COVER_LIVING_ROOM_BLINDS = "cover.living_room_blinds"
+PAST_FIRST_SETUP_RETRY = timedelta(seconds=30)
 ENTITY_SENSOR_DISCRETE_RSSI_LEVEL = "sensor.zipscreen_woonkamer_discrete_rssi_level"
 ENTITY_ALARM_CONTROL_PANEL = "alarm_control_panel.alarm"
 ENTITY_SWITCH_GARAGE = "switch.garage"
@@ -204,3 +215,160 @@ async def test_setup_transient_error_retries(
 
     assert mock_rexel_config_entry.state is ConfigEntryState.SETUP_RETRY
     assert not hass.config_entries.flow.async_progress()
+
+
+NO_REAL_DEVICES = [
+    pytest.param(False, id="no_devices"),
+    pytest.param(True, id="internal_only"),
+]
+
+
+def _internal_devices(client: MockOverkizClient) -> list[Device]:
+    """Return the gateway's own devices from the loaded setup fixture."""
+    internal = [
+        device
+        for device in client.setup.devices
+        if device.device_url.startswith("internal://")
+    ]
+    assert internal
+    assert len(internal) < len(client.setup.devices)
+    return internal
+
+
+def _report_no_real_devices(client: MockOverkizClient, keep_internal: bool) -> None:
+    """Make the setup list no devices, or only the gateway's internal ones."""
+    client.setup.devices = _internal_devices(client) if keep_internal else []
+
+
+@pytest.mark.parametrize("keep_internal", NO_REAL_DEVICES)
+async def test_setup_local_without_real_devices_retries(
+    hass: HomeAssistant,
+    mock_local_config_entry: MockConfigEntry,
+    mock_client: MockOverkizClient,
+    keep_internal: bool,
+) -> None:
+    """A local gateway reporting no real devices yet is retried, not left dead."""
+    mock_local_config_entry.add_to_hass(hass)
+    mock_client.set_setup_fixture(SETUP_FIXTURE_WITH_INTERNAL_DEVICES)
+    _report_no_real_devices(mock_client, keep_internal)
+
+    with patch(
+        "homeassistant.components.overkiz.create_local_client",
+        return_value=mock_client,
+    ):
+        await hass.config_entries.async_setup(mock_local_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert mock_local_config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert mock_local_config_entry.reason == "Gateway has not reported its devices yet"
+
+
+@pytest.mark.parametrize("keep_internal", NO_REAL_DEVICES)
+async def test_setup_local_without_real_devices_does_not_poll_events(
+    hass: HomeAssistant,
+    mock_local_config_entry: MockConfigEntry,
+    mock_client: MockOverkizClient,
+    keep_internal: bool,
+) -> None:
+    """The not-ready guard runs before the first event refresh."""
+    mock_local_config_entry.add_to_hass(hass)
+    mock_client.set_setup_fixture(SETUP_FIXTURE_WITH_INTERNAL_DEVICES)
+    _report_no_real_devices(mock_client, keep_internal)
+
+    with patch(
+        "homeassistant.components.overkiz.create_local_client",
+        return_value=mock_client,
+    ):
+        await hass.config_entries.async_setup(mock_local_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    mock_client.fetch_events.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "real_device_url",
+    [
+        pytest.param("zigbee://1234-5678-6508/65535", id="protocol_gateway_stack"),
+        pytest.param("io://1234-5678-6508/6380765", id="blind"),
+    ],
+)
+@pytest.mark.parametrize("real_device_first", [True, False], ids=["first", "last"])
+async def test_setup_local_with_one_real_device_loads(
+    hass: HomeAssistant,
+    mock_local_config_entry: MockConfigEntry,
+    mock_client: MockOverkizClient,
+    real_device_url: str,
+    real_device_first: bool,
+) -> None:
+    """A single non-internal device is enough, wherever it is listed."""
+    mock_local_config_entry.add_to_hass(hass)
+    mock_client.set_setup_fixture(SETUP_FIXTURE_WITH_INTERNAL_DEVICES)
+    real_device = next(
+        device
+        for device in mock_client.setup.devices
+        if device.device_url == real_device_url
+    )
+    internal_devices = _internal_devices(mock_client)
+    mock_client.setup.devices = (
+        [real_device, *internal_devices]
+        if real_device_first
+        else [*internal_devices, real_device]
+    )
+
+    with patch(
+        "homeassistant.components.overkiz.create_local_client",
+        return_value=mock_client,
+    ):
+        await hass.config_entries.async_setup(mock_local_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert mock_local_config_entry.state is ConfigEntryState.LOADED
+
+
+async def test_setup_local_loads_once_gateway_reports_devices(
+    hass: HomeAssistant,
+    mock_local_config_entry: MockConfigEntry,
+    mock_client: MockOverkizClient,
+) -> None:
+    """A retried local setup loads once the gateway lists its real devices."""
+    mock_local_config_entry.add_to_hass(hass)
+    mock_client.set_setup_fixture(SETUP_FIXTURE_WITH_INTERNAL_DEVICES)
+    all_devices = mock_client.setup.devices
+    _report_no_real_devices(mock_client, keep_internal=True)
+
+    with patch(
+        "homeassistant.components.overkiz.create_local_client",
+        return_value=mock_client,
+    ):
+        await hass.config_entries.async_setup(mock_local_config_entry.entry_id)
+        await hass.async_block_till_done()
+        assert mock_local_config_entry.state is ConfigEntryState.SETUP_RETRY
+
+        mock_client.setup.devices = all_devices
+        async_fire_time_changed(hass, dt_util.utcnow() + PAST_FIRST_SETUP_RETRY)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert mock_local_config_entry.state is ConfigEntryState.LOADED
+    assert hass.states.get(ENTITY_COVER_LIVING_ROOM_BLINDS) is not None
+
+
+@pytest.mark.parametrize("keep_internal", NO_REAL_DEVICES)
+async def test_setup_cloud_without_real_devices_loads(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_client: MockOverkizClient,
+    keep_internal: bool,
+) -> None:
+    """The no-real-devices retry only applies to the local API."""
+    mock_config_entry.add_to_hass(hass)
+    mock_client.set_setup_fixture(SETUP_FIXTURE_WITH_INTERNAL_DEVICES)
+    _report_no_real_devices(mock_client, keep_internal)
+
+    with patch(
+        "homeassistant.components.overkiz.create_cloud_client",
+        return_value=mock_client,
+    ):
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
